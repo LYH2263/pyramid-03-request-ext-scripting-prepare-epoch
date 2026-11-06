@@ -1,9 +1,30 @@
+from collections import deque
+
 from pyramid.config import global_registries
 from pyramid.exceptions import ConfigurationError
 from pyramid.interfaces import IRequestFactory, IRootFactory
 from pyramid.request import Request, apply_request_extensions
 from pyramid.threadlocal import RequestContext
 from pyramid.traversal import DefaultRootFactory
+
+
+def _settle_finished_callbacks(request, offset):
+    # Settle only the finished callbacks registered for this scripting
+    # generation (those appended after ``offset``).  A nested prepare,
+    # even one reusing the same request, must not drain the outer
+    # environment's callbacks when its closer runs.
+    callbacks = getattr(request, 'finished_callbacks', None)
+    if callbacks and len(callbacks) > offset:
+        pending = deque()
+        while len(callbacks) > offset:
+            pending.appendleft(callbacks.pop())
+        while pending:
+            callback = pending.popleft()
+            callback(request)
+    if callbacks is not None and len(callbacks) == 0:
+        # mirror Request._process_finished_callbacks when this generation
+        # owned every remaining callback
+        request.__dict__.pop('finished_callbacks', None)
 
 
 def get_root(app, request=None):
@@ -17,6 +38,13 @@ def get_root(app, request=None):
     factory to compute the root. If ``request`` is None, a default
     will be constructed using the registry's :term:`Request Factory`
     via the :meth:`pyramid.interfaces.IRequestFactory.blank` method.
+
+    Unlike :func:`prepare`, request extensions registered with
+    :meth:`pyramid.config.Configurator.add_request_method` are **not**
+    applied to the request, and its ``closer`` only ends the request
+    context: finished callbacks are not invoked.  Use :func:`prepare`
+    when the script needs a request pinned to the current request
+    extension generation.
     """
     registry = app.registry
     if request is None:
@@ -74,6 +102,13 @@ def prepare(request=None, registry=None):
 
        Added the ability to use the return value as a context manager.
 
+    The request is pinned to the request extension generation that was
+    current when ``prepare`` was called (see
+    :func:`pyramid.request.apply_request_extensions`): a nested
+    ``prepare`` settles only its own generation's finished callbacks and
+    restores the outer environment (registry, request and extension view)
+    when its ``closer`` runs.
+
     .. versionchanged:: 2.0
 
        Request finished callbacks added via
@@ -97,11 +132,20 @@ def prepare(request=None, registry=None):
     request.registry = registry
     ctx = RequestContext(request)
     ctx.begin()
+    # apply the current request extension generation and pin the request
+    # to it before the root factory runs; get_root deliberately skips this
     apply_request_extensions(request)
 
+    # remember how many finished callbacks predate this scripting
+    # generation so the closer only settles its own callbacks and never
+    # drains an outer generation when prepares are nested
+    existing_callbacks = getattr(request, 'finished_callbacks', None)
+    finished_offset = (
+        len(existing_callbacks) if existing_callbacks is not None else 0
+    )
+
     def closer():
-        if request.finished_callbacks:
-            request._process_finished_callbacks()
+        _settle_finished_callbacks(request, finished_offset)
         ctx.end()
 
     root_factory = registry.queryUtility(

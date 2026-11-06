@@ -174,6 +174,83 @@ class TestFactoriesMixin(unittest.TestCase):
 
         self.assertRaises(ConfigurationError, get_bad_name)
 
+    def test_request_extensions_initial_epoch(self):
+        from pyramid.config.factories import _RequestExtensions
+
+        exts = _RequestExtensions()
+        self.assertEqual(exts.methods, {})
+        self.assertEqual(exts.descriptors, {})
+        self.assertEqual(exts.epoch, 0)
+
+    def test_add_request_method_bumps_epoch_on_commit(self):
+        from pyramid.interfaces import IRequestExtensions
+
+        config = self._makeOne()
+        config.commit()
+        self.assertTrue(
+            config.registry.queryUtility(IRequestExtensions) is None
+        )
+
+        def foo(r):  # pragma: no cover
+            pass
+
+        def bar(r):  # pragma: no cover
+            pass
+
+        config.add_request_method(foo, name='foo')
+        # a pending registration must not announce the new generation yet
+        exts = config.registry.queryUtility(IRequestExtensions)
+        self.assertTrue(exts is None)
+        config.commit()
+        exts = config.registry.getUtility(IRequestExtensions)
+        self.assertEqual(exts.epoch, 1)
+        self.assertIn('foo', exts.methods)
+
+        config.add_request_method(bar, name='bar', property=True)
+        config.commit()
+        self.assertEqual(exts.epoch, 2)
+        self.assertIn('bar', exts.descriptors)
+
+    def test_add_request_method_bumps_epoch_autocommit(self):
+        from pyramid.interfaces import IRequestExtensions
+
+        config = self._makeOne(autocommit=True)
+        config.add_request_method(lambda r: None, name='foo')
+        exts = config.registry.getUtility(IRequestExtensions)
+        self.assertEqual(exts.epoch, 1)
+        config.add_request_method(lambda r: None, name='bar')
+        self.assertEqual(exts.epoch, 2)
+
+    def test_set_request_method_property_conflict(self):
+        from pyramid.exceptions import ConfigurationConflictError
+
+        config = self._makeOne()
+
+        def foo(self):  # pragma: no cover
+            pass
+
+        def bar(self):  # pragma: no cover
+            pass
+
+        config.add_request_method(foo, name='same')
+        config.add_request_method(bar, name='same', property=True)
+        self.assertRaises(ConfigurationConflictError, config.commit)
+
+    def test_set_request_reify_conflict(self):
+        from pyramid.exceptions import ConfigurationConflictError
+
+        config = self._makeOne()
+
+        def foo(self):  # pragma: no cover
+            pass
+
+        def bar(self):  # pragma: no cover
+            pass
+
+        config.add_request_method(foo, name='same', reify=True)
+        config.add_request_method(bar, name='same', reify=True)
+        self.assertRaises(ConfigurationConflictError, config.commit)
+
     def test_set_execution_policy(self):
         from pyramid.interfaces import IExecutionPolicy
 

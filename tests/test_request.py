@@ -548,6 +548,70 @@ class Test_apply_request_extensions(unittest.TestCase):
         self.assertEqual(request.bar, 'bar')
         self.assertEqual(request.foo('abc'), 'abc')
 
+    def test_it_pins_request_to_extensions_epoch(self):
+        from pyramid.request import Request
+        from pyramid.util import REQUEST_EXTENSIONS_EPOCH
+
+        extensions = Dummy()
+        extensions.methods = {'foo': lambda x, y: y}
+        extensions.descriptors = {}
+        extensions.epoch = 1
+        request = Request.blank('/')
+        request.registry = self.config.registry
+        self._callFUT(request, extensions=extensions)
+        self.assertEqual(getattr(request, REQUEST_EXTENSIONS_EPOCH), 1)
+        self.assertEqual(request.foo('abc'), 'abc')
+
+    def test_applying_same_epoch_is_a_noop(self):
+        from pyramid.request import Request
+        from pyramid.util import REQUEST_EXTENSIONS_EPOCH
+
+        extensions = Dummy()
+        extensions.methods = {}
+        extensions.descriptors = {'bar': property(lambda x: 'bar')}
+        extensions.epoch = 3
+        request = Request.blank('/')
+        request.registry = self.config.registry
+        self._callFUT(request, extensions=extensions)
+        cls = request.__class__
+        self.assertEqual(request.bar, 'bar')
+        # re-applying the same generation does not restack the class
+        self._callFUT(request, extensions=extensions)
+        self.assertIs(request.__class__, cls)
+        self.assertEqual(getattr(request, REQUEST_EXTENSIONS_EPOCH), 3)
+
+    def test_applying_newer_epoch_rewrites_and_repins(self):
+        from pyramid.interfaces import IRequestExtensions
+        from pyramid.request import Request
+        from pyramid.util import REQUEST_EXTENSIONS_EPOCH
+
+        extensions = Dummy()
+        extensions.methods = {'foo': lambda x, y: y}
+        extensions.descriptors = {'bar': property(lambda x: 'bar')}
+        extensions.epoch = 1
+        self.config.registry.registerUtility(extensions, IRequestExtensions)
+        request = Request.blank('/')
+        request.registry = self.config.registry
+        self._callFUT(request)
+        self.assertEqual(request.foo('abc'), 'abc')
+        self.assertEqual(request.bar, 'bar')
+
+        # a new registration generation adds an extension
+        extensions.methods['baz'] = lambda x, y: y
+        extensions.epoch = 2
+
+        # a request that is never re-applied keeps its pinned view
+        other = Request.blank('/')
+        other.registry = self.config.registry
+        self.assertFalse(hasattr(other, 'baz'))
+
+        self._callFUT(request)
+        self.assertEqual(getattr(request, REQUEST_EXTENSIONS_EPOCH), 2)
+        self.assertEqual(request.baz('xyz'), 'xyz')
+        # earlier extensions remain visible
+        self.assertEqual(request.foo('abc'), 'abc')
+        self.assertEqual(request.bar, 'bar')
+
 
 class Test_subclassing_Request(unittest.TestCase):
     def test_subclass(self):
@@ -708,6 +772,61 @@ class TestRequestLocalCache(unittest.TestCase):
         cache = self._makeOne()
         req = DummyRequest()
         self.assertRaises(ValueError, cache.get_or_create, req)
+
+    def test_stale_generation_value_is_not_served(self):
+        from pyramid.util import REQUEST_EXTENSIONS_EPOCH
+
+        calls = []
+
+        @self._makeOne()
+        def foo(request):
+            calls.append(1)
+            return len(calls)
+
+        req = DummyRequest()
+        self.assertEqual(foo(req), 1)
+        self.assertEqual(foo(req), 1)
+        # the request crosses into a newer request extension generation
+        # without its finished callbacks being processed
+        setattr(req, REQUEST_EXTENSIONS_EPOCH, 7)
+        self.assertEqual(foo(req), 2)
+        # the fresh value is cached for the new generation
+        self.assertEqual(foo(req), 2)
+        # only one finished callback was ever registered
+        self.assertEqual(len(req.finished_callbacks), 1)
+
+    def test_finished_callback_discards_value_and_epoch(self):
+        calls = []
+
+        @self._makeOne()
+        def foo(request):
+            calls.append(1)
+            return len(calls)
+
+        req = DummyRequest()
+        self.assertEqual(foo(req), 1)
+        req.finished_callbacks[0](req)
+        # after the request finishes the stored value is gone
+        self.assertEqual(foo(req), 2)
+
+    def test_distinct_requests_never_share_generation_values(self):
+        calls = []
+
+        @self._makeOne()
+        def foo(request):
+            calls.append(1)
+            return len(calls)
+
+        req1 = DummyRequest()
+        req2 = DummyRequest()
+        self.assertEqual(foo(req1), 1)
+        self.assertEqual(foo(req2), 2)
+        # a newer generation on req1 never leaks to req2
+        from pyramid.util import REQUEST_EXTENSIONS_EPOCH
+
+        setattr(req1, REQUEST_EXTENSIONS_EPOCH, 2)
+        self.assertEqual(foo(req1), 3)
+        self.assertEqual(foo(req2), 2)
 
 
 class Dummy:

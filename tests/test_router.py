@@ -1684,6 +1684,59 @@ class TestRouter(unittest.TestCase):
         self.assertEqual(result[0].path_info, '/test_path')
         self.assertEqual(result[1], None)
 
+    def test_request_context_applies_current_extensions_generation(self):
+        from pyramid.interfaces import IRequestExtensions
+        from pyramid.request import Request
+        from pyramid.util import REQUEST_EXTENSIONS_EPOCH
+
+        self.config.add_request_method(lambda r: 'gen1', name='ext_one')
+        router = self._makeOne()  # built at generation one
+        environ = Request.blank('/').environ
+        with router.request_context(environ) as request:
+            self.assertEqual(request.ext_one(), 'gen1')
+            first_epoch = getattr(request, REQUEST_EXTENSIONS_EPOCH)
+
+        # commit a new request extension generation after the router exists
+        self.config.add_request_method(lambda r: 'gen2', name='ext_two')
+        exts = self.registry.getUtility(IRequestExtensions)
+
+        with router.request_context(Request.blank('/').environ) as request:
+            self.assertEqual(request.ext_one(), 'gen1')
+            self.assertEqual(request.ext_two(), 'gen2')
+            current_epoch = getattr(request, REQUEST_EXTENSIONS_EPOCH)
+            self.assertEqual(current_epoch, exts.epoch)
+            self.assertGreater(current_epoch, first_epoch)
+
+    def test_request_context_extensions_registered_after_router_build(self):
+        from pyramid.interfaces import IRequestExtensions
+        from pyramid.request import Request
+
+        router = self._makeOne()  # no request extensions registered yet
+        self.assertIsNone(
+            self.registry.queryUtility(IRequestExtensions)
+        )
+        self.config.add_request_method(lambda r: 'late', name='ext_late')
+        with router.request_context(Request.blank('/').environ) as request:
+            self.assertEqual(request.ext_late(), 'late')
+
+    def test_invoke_subrequest_applies_current_extensions_generation(self):
+        from pyramid.httpexceptions import HTTPNotFound
+        from pyramid.request import Request
+
+        self.config.add_request_method(lambda r: 'gen1', name='ext_one')
+        router = self._makeOne()  # built at generation one
+        # commit a new generation before the subrequest enters
+        self.config.add_request_method(lambda r: 'gen2', name='ext_two')
+        subrequest = Request.blank('/')
+        self.assertRaises(
+            HTTPNotFound,
+            router.invoke_subrequest,
+            subrequest,
+            use_tweens=False,
+        )
+        self.assertEqual(subrequest.ext_one(), 'gen1')
+        self.assertEqual(subrequest.ext_two(), 'gen2')
+
 
 class DummyPredicate:
     def __call__(self, info, request):

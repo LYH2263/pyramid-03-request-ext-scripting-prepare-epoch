@@ -1,6 +1,7 @@
 import threading
 
 from pyramid.registry import global_registry
+from pyramid.util import get_request_extensions_epoch
 
 
 class ThreadLocalManager(threading.local):
@@ -74,15 +75,40 @@ def get_current_registry(
 class RequestContext:
     def __init__(self, request):
         self.request = request
+        self._frame = None
+
+    @property
+    def epoch(self):
+        """The request extension generation pinned to this context's
+        request.  ``None`` when no generation has been applied to the
+        request (notably a :func:`pyramid.scripting.get_root` request,
+        which never gets request extensions)."""
+        return get_request_extensions_epoch(self.request)
 
     def begin(self):
         request = self.request
         registry = request.registry
-        manager.push({'registry': registry, 'request': request})
+        # Each begin declares its own generation boundary frame; end()
+        # pops exactly this frame, so nested scripting/inbound contexts
+        # restore the outer request instead of inheriting a stale current
+        # request or extension view.
+        frame = {'registry': registry, 'request': request, 'context': self}
+        self._frame = frame
+        manager.push(frame)
         return request
 
     def end(self):
-        manager.pop()
+        frame = self._frame
+        if frame is None:
+            return
+        stack = manager.stack
+        # unwind exactly our own frame even if the stack was disturbed by
+        # nested generation churn, restoring the outer current request
+        while stack:
+            top = stack.pop()
+            if top is frame:
+                break
+        self._frame = None
 
     def __enter__(self):
         return self.begin()

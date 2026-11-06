@@ -184,6 +184,11 @@ class Router:
         request.registry = self.registry
         request.invoke_subrequest = self.invoke_subrequest
         extensions = self.request_extensions
+        if extensions is None:
+            # the router may predate the first request extension
+            # registration; resolve the current generation at ingress so
+            # extensions committed after the router was built still apply
+            extensions = self.registry.queryUtility(IRequestExtensions)
         if extensions is not None:
             apply_request_extensions(request, extensions=extensions)
         with RequestContext(request):
@@ -221,6 +226,10 @@ class Router:
         request.registry = self.registry
         request.invoke_subrequest = self.invoke_subrequest
         extensions = self.request_extensions
+        if extensions is None:
+            # resolve the current generation at ingress for routers built
+            # before any request extensions were registered
+            extensions = self.registry.queryUtility(IRequestExtensions)
         if extensions is not None:
             apply_request_extensions(request, extensions=extensions)
         return RequestContext(request)

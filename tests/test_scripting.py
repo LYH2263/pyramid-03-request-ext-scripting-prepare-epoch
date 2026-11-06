@@ -206,6 +206,273 @@ class Test__make_request(unittest.TestCase):
             global_registries.empty()
 
 
+class TestRequestExtensionGenerations(unittest.TestCase):
+    """Same-process, same-registry timing between scripting environments
+    and router inbound requests."""
+
+    def setUp(self):
+        from pyramid.config import Configurator
+        from pyramid.router import Router
+        from pyramid.threadlocal import manager
+
+        self.manager = manager
+        self.default = manager.get()
+        self._envs = []
+        self.config = Configurator(settings=self._settings())
+        self.config.add_request_method(lambda r: 'gen1', name='ext_method')
+        self.config.add_request_method(
+            lambda r: object(), name='ext_prop', property=True
+        )
+        self.config.add_request_method(
+            lambda r: object(), name='ext_reified', reify=True
+        )
+        self.config.commit()
+        self.registry = self.config.registry
+        # the router is built at generation 1 and never rebuilt
+        self.router = Router(self.registry)
+
+    def tearDown(self):
+        while self._envs:
+            env = self._envs.pop()
+            try:
+                env['closer']()
+            except Exception:
+                pass
+        self.assertEqual(self.default, self.manager.get())
+
+    def _settings(self):
+        return {'debug_notfound': False, 'debug_routematch': False}
+
+    def _prepare(self, request=None):
+        from pyramid.scripting import prepare
+
+        env = prepare(request=request, registry=self.registry)
+        self._envs.append(env)
+        return env
+
+    def _close(self, env):
+        env['closer']()
+        self._envs.remove(env)
+
+    def _commit_generation_two(self, name='ext_later', value='gen2'):
+        from pyramid.interfaces import IRequestExtensions
+
+        exts = self.registry.getUtility(IRequestExtensions)
+        self.assertEqual(exts.epoch, 3)
+        self.config.add_request_method(lambda r: value, name=name)
+        self.config.commit()
+        self.assertEqual(exts.epoch, 4)
+        return exts
+
+    def test_method_property_reify_differences_on_prepare(self):
+        env = self._prepare()
+        request = env['request']
+        # plain method is callable and receives the request
+        self.assertEqual(request.ext_method(), 'gen1')
+        # plain property recomputes on every read
+        self.assertIsNot(request.ext_prop, request.ext_prop)
+        # reify caches the computed object for the request lifetime
+        self.assertIs(request.ext_reified, request.ext_reified)
+        self._close(env)
+
+    def test_prepare_mounts_extensions_get_root_does_not(self):
+        from pyramid.scripting import get_root
+        from pyramid.threadlocal import get_current_request
+
+        env = self._prepare()
+        self.assertTrue(hasattr(env['request'], 'ext_method'))
+        self._close(env)
+
+        root, closer = get_root(self.router)
+        request = get_current_request()
+        self.assertFalse(hasattr(request, 'ext_method'))
+        self.assertFalse(hasattr(request, 'ext_reified'))
+        closer()
+
+    def test_prepare_closer_runs_finished_get_root_closer_does_not(self):
+        from pyramid.scripting import get_root
+        from pyramid.threadlocal import get_current_request
+
+        events = []
+        env = self._prepare()
+        env['request'].add_finished_callback(
+            lambda r: events.append('prepare')
+        )
+        self._close(env)
+        self.assertEqual(events, ['prepare'])
+
+        root, closer = get_root(self.router)
+        request = get_current_request()
+        request.add_finished_callback(lambda r: events.append('get_root'))
+        closer()
+        # the get_root closer only ends the context
+        self.assertEqual(events, ['prepare'])
+
+    def test_nested_prepare_isolates_callbacks_and_current_request(self):
+        from pyramid.threadlocal import get_current_request
+
+        events = []
+        outer = self._prepare()
+        outer['request'].add_finished_callback(
+            lambda r: events.append(('outer', r is outer['request']))
+        )
+
+        inner = self._prepare()
+        self.assertIs(get_current_request(), inner['request'])
+        self.assertIsNot(inner['request'], outer['request'])
+        inner['request'].add_finished_callback(
+            lambda r: events.append(('inner', r is inner['request']))
+        )
+
+        self._close(inner)
+        # the inner closer settles only the inner request's callbacks
+        self.assertEqual(events, [('inner', True)])
+        # the outer environment is exactly restored
+        self.assertIs(get_current_request(), outer['request'])
+
+        self._close(outer)
+        self.assertEqual(events, [('inner', True), ('outer', True)])
+        self.assertIsNone(get_current_request())
+
+    def test_nested_prepare_same_request_never_drains_outer_callbacks(self):
+        from pyramid.threadlocal import get_current_request
+
+        events = []
+        outer = self._prepare()
+        request = outer['request']
+        request.add_finished_callback(lambda r: events.append('outer'))
+
+        inner = self._prepare(request=request)
+        request.add_finished_callback(lambda r: events.append('inner'))
+
+        self._close(inner)
+        self.assertEqual(events, ['inner'])
+        self.assertIs(get_current_request(), request)
+
+        self._close(outer)
+        self.assertEqual(events, ['inner', 'outer'])
+        self.assertIsNone(get_current_request())
+
+    def test_nested_get_root_restores_outer_prepare_view(self):
+        from pyramid.scripting import get_root
+        from pyramid.threadlocal import get_current_request
+
+        outer = self._prepare()
+        outer_request = outer['request']
+
+        root, closer = get_root(self.router)
+        inner_request = get_current_request()
+        self.assertIsNot(inner_request, outer_request)
+        # get_root never mounts request extensions
+        self.assertFalse(hasattr(inner_request, 'ext_method'))
+        closer()
+
+        self.assertIs(get_current_request(), outer_request)
+        self.assertEqual(get_current_request().ext_method(), 'gen1')
+        self._close(outer)
+
+    def test_new_generation_pins_old_request_new_prepare_sees_new(self):
+        env1 = self._prepare()
+        old_request = env1['request']
+        self.assertFalse(hasattr(old_request, 'ext_later'))
+
+        self._commit_generation_two()
+
+        # the already prepared request keeps its old generation view
+        self.assertFalse(hasattr(old_request, 'ext_later'))
+
+        env2 = self._prepare()
+        new_request = env2['request']
+        self.assertEqual(new_request.ext_later(), 'gen2')
+        # previous generation extensions remain visible
+        self.assertEqual(new_request.ext_method(), 'gen1')
+        self.assertIs(new_request.ext_reified, new_request.ext_reified)
+        self._close(env2)
+        self._close(env1)
+
+    def test_new_generation_visible_to_router_inbound(self):
+        from pyramid.httpexceptions import HTTPNotFound
+        from pyramid.request import Request
+
+        self._commit_generation_two()
+
+        environ = Request.blank('/').environ
+        with self.router.request_context(environ) as request:
+            self.assertEqual(request.ext_method(), 'gen1')
+            self.assertEqual(request.ext_later(), 'gen2')
+
+        subrequest = Request.blank('/')
+        self.assertRaises(
+            HTTPNotFound,
+            self.router.invoke_subrequest,
+            subrequest,
+            use_tweens=False,
+        )
+        # the subrequest ingress path shares the same registration
+        self.assertEqual(subrequest.ext_method(), 'gen1')
+        self.assertEqual(subrequest.ext_later(), 'gen2')
+
+    def test_router_built_before_extensions_sees_later_ingress(self):
+        from pyramid.config import Configurator
+        from pyramid.request import Request
+        from pyramid.router import Router
+
+        config = Configurator(settings=self._settings())
+        router = Router(config.registry)  # no extensions registered yet
+        config.add_request_method(lambda r: 'late', name='ext_late')
+        config.commit()
+        with router.request_context(Request.blank('/').environ) as request:
+            self.assertEqual(request.ext_late(), 'late')
+
+    def test_request_local_cache_generation_boundary(self):
+        from pyramid.request import RequestLocalCache
+
+        calls = []
+        cache = RequestLocalCache()
+
+        def load(request):
+            calls.append(1)
+            return object()
+
+        outer = self._prepare()
+        request = outer['request']
+        first = cache.get_or_create(request, load)
+        self.assertIs(cache.get_or_create(request, load), first)
+        self.assertEqual(len(calls), 1)
+
+        self._commit_generation_two()
+
+        inner = self._prepare(request=request)
+        # the request crossed into the new generation during nested prepare
+        second = cache.get_or_create(request, load)
+        self.assertIsNot(second, first)
+        self.assertEqual(request.ext_later(), 'gen2')
+        self.assertIs(cache.get_or_create(request, load), second)
+
+        self._close(inner)
+        self._close(outer)
+
+    def test_request_local_cache_isolates_prepared_generations(self):
+        from pyramid.request import RequestLocalCache
+
+        cache = RequestLocalCache()
+        marker = []
+
+        def load(request):
+            marker.append(1)
+            return len(marker)
+
+        self._commit_generation_two()
+        env1 = self._prepare()
+        env2 = self._prepare()
+        self.assertEqual(cache.get_or_create(env1['request'], load), 1)
+        self.assertEqual(cache.get_or_create(env2['request'], load), 2)
+        self.assertEqual(cache.get_or_create(env1['request'], load), 1)
+        self.assertEqual(cache.get_or_create(env2['request'], load), 2)
+        self._close(env2)
+        self._close(env1)
+
+
 class Dummy:
     pass
 

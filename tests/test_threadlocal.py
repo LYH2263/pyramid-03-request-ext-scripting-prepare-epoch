@@ -72,6 +72,72 @@ class TestGetCurrentRequest(unittest.TestCase):
         self.assertEqual(self._callFUT(), None)
 
 
+class TestRequestContext(unittest.TestCase):
+    def _getTargetClass(self):
+        from pyramid.threadlocal import RequestContext
+
+        return RequestContext
+
+    def _makeOne(self, request=None):
+        if request is None:
+            request = DummyRequest()
+        return self._getTargetClass()(request)
+
+    def test_epoch_follows_pinned_generation(self):
+        from pyramid.util import REQUEST_EXTENSIONS_EPOCH
+
+        request = DummyRequest()
+        ctx = self._makeOne(request)
+        # nothing applied to the request yet (e.g. a get_root request)
+        self.assertIsNone(ctx.epoch)
+        setattr(request, REQUEST_EXTENSIONS_EPOCH, 4)
+        self.assertEqual(ctx.epoch, 4)
+
+    def test_begin_and_end_are_generation_boundaries(self):
+        from pyramid.threadlocal import get_current_registry, get_current_request
+
+        outer_request = DummyRequest()
+        outer = self._makeOne(outer_request)
+        outer.begin()
+        self.assertIs(get_current_request(), outer_request)
+
+        inner_request = DummyRequest()
+        inner = self._makeOne(inner_request)
+        inner.begin()
+        self.assertIs(get_current_request(), inner_request)
+
+        # ending the inner boundary restores the outer current request
+        inner.end()
+        self.assertIs(get_current_request(), outer_request)
+        self.assertIs(get_current_registry(), outer_request.registry)
+        outer.end()
+        self.assertIsNone(get_current_request())
+
+    def test_end_is_idempotent(self):
+        ctx = self._makeOne()
+        ctx.begin()
+        ctx.end()
+        ctx.end()  # must not pop a frame belonging to another context
+
+    def test_end_unwinds_to_its_own_frame(self):
+        from pyramid.threadlocal import manager
+
+        outer_request = DummyRequest()
+        outer = self._makeOne(outer_request)
+        outer.begin()
+        # a stray frame pushed on top of the outer boundary
+        manager.push({'registry': object(), 'request': object()})
+        # ending the outer context must not leave the current request
+        # pointing at the stray frame
+        outer.end()
+        self.assertIsNone(manager.get()['request'])
+
+
+class DummyRequest:
+    def __init__(self):
+        self.registry = object()
+
+
 class GetCurrentRegistryTests(unittest.TestCase):
     def setUp(self):
         testing.setUp()

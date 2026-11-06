@@ -690,6 +690,16 @@ class IRequestExtensions(Interface):
         """A list of descriptors that will be added to each request."""
     )
     methods = Attribute("""A list of methods to be added to each request.""")
+    epoch = Attribute(
+        """Monotonic generation of the request extension registration.
+
+        It is bumped every time a request method or property is committed to
+        the registry.  A request instance is pinned to the generation that
+        was applied to it, so already-prepared or in-flight requests keep
+        their extension view while requests prepared on later generations
+        observe the newly registered extensions.
+        """
+    )
 
 
 class IRouteRequest(Interface):

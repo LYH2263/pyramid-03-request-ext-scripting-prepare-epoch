@@ -86,6 +86,23 @@ class SettableProperty:
         return self.wrapped(obj)
 
 
+#: Name of the attribute stamped on a request instance by
+#: :func:`pyramid.request.apply_request_extensions`.  Its value is the
+#: request extension generation (``IRequestExtensions.epoch``) that has
+#: been written onto that instance, pinning it to that generation.
+REQUEST_EXTENSIONS_EPOCH = '_request_extensions_epoch'
+
+
+def get_request_extensions_epoch(request):
+    """Return the request extension generation pinned to ``request``.
+
+    Returns ``None`` when no generation of request extensions has been
+    applied to the request yet (for example a request handed to
+    :func:`pyramid.scripting.get_root`, which never applies extensions).
+    """
+    return getattr(request, REQUEST_EXTENSIONS_EPOCH, None)
+
+
 class InstancePropertyHelper:
     """A helper object for assigning properties and descriptors to instances.
     It is not normally possible to do this because descriptors must be

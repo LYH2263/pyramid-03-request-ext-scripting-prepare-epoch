@@ -199,6 +199,10 @@ class FactoriesConfiguratorMixin:
 
             plist = exts.descriptors if property else exts.methods
             plist[name] = callable
+            # declare a new request extension generation so that requests
+            # prepared after this commit observe the new registration while
+            # requests pinned to an earlier generation keep their view
+            exts.epoch += 1
 
         if callable is None:
             self.action(('request extensions', name), None)
@@ -261,3 +265,6 @@ class _RequestExtensions:
     def __init__(self):
         self.descriptors = {}
         self.methods = {}
+        # current generation of the registration; bumped on every committed
+        # add_request_method; see IRequestExtensions.epoch
+        self.epoch = 0

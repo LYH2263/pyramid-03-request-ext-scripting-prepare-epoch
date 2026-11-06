@@ -18,10 +18,12 @@ from pyramid.response import Response, _get_response_factory
 from pyramid.security import AuthenticationAPIMixin, SecurityAPIMixin
 from pyramid.url import URLMethodsMixin
 from pyramid.util import (
+    REQUEST_EXTENSIONS_EPOCH,
     InstancePropertyHelper,
     InstancePropertyMixin,
     Sentinel,
     bytes_,
+    get_request_extensions_epoch,
     text_,
 )
 from pyramid.view import ViewMethodsMixin
@@ -333,10 +335,24 @@ def apply_request_extensions(request, extensions=None):
     After invoking this method, the ``request`` should have the methods
     and properties that were defined using
     :meth:`pyramid.config.Configurator.add_request_method`.
+
+    The request is pinned to the generation
+    (:attr:`pyramid.interfaces.IRequestExtensions.epoch`) of the extensions
+    that were applied to it: applying the same generation more than once is
+    a no-op, so nested or subrequest ingress paths do not restack the
+    request's class, while applying a newer generation rewrites the
+    extensions and re-pins the instance. Requests that are never passed
+    through this function (such as the request used by
+    :func:`pyramid.scripting.get_root`) never gain the extensions.
     """
     if extensions is None:
         extensions = request.registry.queryUtility(IRequestExtensions)
     if extensions is not None:
+        epoch = getattr(extensions, 'epoch', 0)
+        if get_request_extensions_epoch(request) == epoch:
+            # already carrying this generation; keep the request pinned
+            return
+
         for name, fn in extensions.methods.items():
             method = fn.__get__(request, request.__class__)
             setattr(request, name, method)
@@ -344,6 +360,10 @@ def apply_request_extensions(request, extensions=None):
         InstancePropertyHelper.apply_properties(
             request, extensions.descriptors
         )
+
+        # stamp the request only after the extensions have been written so
+        # request-local caches observe a single, complete generation view
+        setattr(request, REQUEST_EXTENSIONS_EPOCH, epoch)
 
 
 class RequestLocalCache:
@@ -396,6 +416,12 @@ class RequestLocalCache:
     it will release resources earlier via
     :meth:`pyramid.request.Request.add_finished_callback`.
 
+    A cached value is also bound to the request extension generation that
+    was pinned to the request when it was stored (see
+    :func:`pyramid.request.apply_request_extensions`).  If the request crosses
+    into a newer generation, an older cached value is never handed back: the
+    creator is re-run and the new value is cached for that generation.
+
     .. versionadded:: 2.0
 
     """
@@ -404,6 +430,9 @@ class RequestLocalCache:
 
     def __init__(self, creator=None):
         self._store = weakref.WeakKeyDictionary()
+        # request -> generation pinned to the request when its value was
+        # stored; used to invalidate across request extension generations
+        self._epochs = weakref.WeakKeyDictionary()
         self._creator = creator
 
     def __call__(self, fn):
@@ -425,9 +454,15 @@ class RequestLocalCache:
         The creator may be passed in as an argument or bound to the cache
         by decorating a function or supplied as a constructor argument.
 
+        A value stored for an older request extension generation is never
+        returned; the creator is executed again for the current generation.
+
         """
         result = self._store.get(request, self.NO_VALUE)
-        if result is self.NO_VALUE:
+        stale = self._epochs.get(request) != get_request_extensions_epoch(
+            request
+        )
+        if result is self.NO_VALUE or stale:
             if creator is None:
                 creator = self._creator
                 if creator is None:
@@ -455,10 +490,11 @@ class RequestLocalCache:
         """
         already_set = request in self._store
         self._store[request] = value
+        self._epochs[request] = get_request_extensions_epoch(request)
 
         # avoid registering the callback more than once
         if not already_set:
-            request.add_finished_callback(self._store.pop)
+            request.add_finished_callback(self._discard)
 
     def clear(self, request):
         """
@@ -474,4 +510,12 @@ class RequestLocalCache:
             # keep a value in the store so that we don't register another
             # finished callback when set is invoked
             self._store[request] = self.NO_VALUE
+            self._epochs[request] = get_request_extensions_epoch(request)
         return old_value
+
+    def _discard(self, request):
+        # finished callback: drop both the value and the generation it was
+        # stored for so a finished request never serves a stale generation's
+        # result
+        self._store.pop(request, None)
+        self._epochs.pop(request, None)
